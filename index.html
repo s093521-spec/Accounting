@@ -1,0 +1,317 @@
+import React, { useState, useEffect } from 'react';
+import { Send, CheckCircle2, AlertCircle, Receipt, Calendar, Sparkles, CreditCard, Banknote, History, HelpCircle, Info } from 'lucide-react';
+
+// ==========================================
+// ⚠️ 請在此貼上你部署後的 Google Apps Script URL
+// ==========================================
+const APP_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbyDTnDzNuPZoXTThIA3LeFYhzfsPQfCm1acesZktIgHxTNfflbJdNhzRCMrJqjXoEyd/exec";
+
+// 新增：信用卡官方名稱對照表 (依據 notebookLM 規則)
+const OFFICIAL_CARDS = [
+  "平 國泰_cube", "平 聯邦_全國", "平 台新", "平 富邦_好市多", "平 元大_嘿啤",
+  "如 國泰_蝦皮", "如 中信_賴佩", "如 玉山_Uni", "如 台新", "如 富邦_momo",
+  "平 國泰_cube(媽)", "平 聯邦_全國(媽)", "平 台新(媽)", "平 富邦_好市多(媽)", "平 元大_嘿啤(媽)",
+  "如 國泰_蝦皮(媽)", "如 中信_賴佩(媽)", "如 玉山_Uni(媽)", "如 台新(媽)", "如 富邦_momo(媽)"
+];
+
+// 新增：智慧比對信用卡名稱函式 (支援模糊搜尋)
+const mapCreditCardName = (rawName) => {
+  if (!rawName) return '';
+  
+  // 統一轉小寫、去除空白、全形括號轉半形
+  const normalize = (str) => str.replace(/\s+/g, '').replace(/（/g, '(').replace(/）/g, ')').toLowerCase();
+  const normalizedRaw = normalize(rawName);
+
+  // 將輸入內容轉為模糊搜尋的正規表達式，例如 "聯邦(媽)" 會變成 /聯.*邦.*\(.*媽.*\)/
+  // 這樣就能成功配對到 "平 聯邦_全國(媽)"
+  const pattern = normalizedRaw.split('').map(char => char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*');
+  const regex = new RegExp(pattern);
+
+  const match = OFFICIAL_CARDS.find(card => regex.test(normalize(card)));
+  return match || rawName; // 若字典裡找不到符合的，就保留使用者原本輸入的文字
+};
+
+export default function App() {
+  const [status, setStatus] = useState('idle'); 
+  const [errorMessage, setErrorMessage] = useState('');
+  const [rawInput, setRawInput] = useState('');
+  const [parsedItems, setParsedItems] = useState([]);
+  const [currentYear, setCurrentYear] = useState(new Date().getFullYear());
+  const [showCorsHelp, setShowCorsHelp] = useState(false); // 新增：是否顯示權限教學
+
+  // 核心邏輯：解析輸入字串
+  useEffect(() => {
+    if (!rawInput.trim()) {
+      setParsedItems([]);
+      return;
+    }
+
+    // 新版智慧掃描：同時捕捉「日期」與「消費品項」
+    // 能在一段文字中動態切換日期，並自動略過無關的純文字
+    const tokenRegex = /\b(\d{1,2})\/(\d{1,2})\b|([^\d\s\(\)（）\/]+)(\d+)(?:[\(（]([^\)）]+)[\)）])?/g;
+    
+    const items = [];
+    let match;
+    let currentM = '';
+    let currentD = '';
+
+    while ((match = tokenRegex.exec(rawInput)) !== null) {
+      if (match[1] && match[2]) {
+        // 捕捉到日期 (例如 4/2)
+        currentM = match[1].padStart(2, '0');
+        currentD = match[2];
+      } else if (match[3] && match[4]) {
+        // 捕捉到消費項目 (例如 阿寶 798 (平台新))
+        
+        // 防呆機制：如果一開始沒提供日期，預設使用當天日期
+        let m = currentM;
+        let d = currentD;
+        if (!m || !d) {
+           const today = new Date();
+           m = (today.getMonth() + 1).toString().padStart(2, '0');
+           d = today.getDate().toString();
+           // 更新當前紀錄，讓後續沒日期的項目也跟隨這天
+           currentM = m;
+           currentD = d;
+        }
+
+        items.push({
+          yearMonth: `${currentYear}-${m}`,
+          day: d,
+          item: match[3],
+          amount: match[4],
+          isCredit: !!match[5],
+          note: mapCreditCardName(match[5]) // 修改這裡：套用智慧轉換函式
+        });
+      }
+    }
+
+    setParsedItems(items);
+  }, [rawInput, currentYear]);
+
+  const handleSubmitAll = async () => {
+    if (parsedItems.length === 0) {
+      setErrorMessage('無法解析內容，請確保格式正確 (如: 4/1 飲料70)');
+      setStatus('error');
+      setShowCorsHelp(false);
+      return;
+    }
+
+    const missingCard = parsedItems.find(i => i.isCredit && !i.note);
+    if (missingCard) {
+      setErrorMessage(`品項「${missingCard.item}」標註為刷卡但缺少信用卡名稱`);
+      setStatus('error');
+      setShowCorsHelp(false);
+      return;
+    }
+
+    if (!APP_SCRIPT_URL || APP_SCRIPT_URL.includes("請在此貼上")) {
+      setErrorMessage('請先設定有效的 Google Apps Script URL');
+      setStatus('error');
+      setShowCorsHelp(false);
+      return;
+    }
+
+    setStatus('loading');
+    setShowCorsHelp(false);
+    let successCount = 0;
+    let failMessages = [];
+    let isCorsError = false;
+
+    for (const item of parsedItems) {
+      const data = new URLSearchParams();
+      data.append('yearMonth', item.yearMonth);
+      data.append('day', item.day);
+      data.append('item', item.item);
+      data.append('amount', item.amount);
+      data.append('isCredit', item.isCredit);
+      data.append('note', item.note);
+
+      try {
+        const res = await fetch(APP_SCRIPT_URL, {
+          method: 'POST',
+          // 移除了 mode: 'cors' 讓瀏覽器自動處理預設行為，並確保跟隨 GAS 的 302 重新導向
+          redirect: 'follow', 
+          headers: { 
+            'Content-Type': 'application/x-www-form-urlencoded' 
+          },
+          body: data.toString(),
+        });
+
+        if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+        
+        const result = await res.json();
+        if (result.status === 'success') {
+          successCount++;
+        } else {
+          failMessages.push(result.message || '未知錯誤');
+        }
+      } catch (e) {
+        console.error("Fetch Error:", e);
+        if (e.message.includes('Failed to fetch')) {
+          isCorsError = true;
+          failMessages.push('部署權限遭拒 (CORS 錯誤)');
+        } else {
+          failMessages.push(e.message);
+        }
+      }
+    }
+
+    if (successCount === parsedItems.length) {
+      setStatus('success');
+      setRawInput('');
+      setTimeout(() => setStatus('idle'), 3000);
+    } else {
+      setStatus('error');
+      if (isCorsError) {
+        setShowCorsHelp(true);
+        setErrorMessage(`連線失敗！請確認 GAS 權限設定。`);
+      } else {
+        const errorDetail = failMessages.length > 0 ? failMessages[0] : '發生未知錯誤';
+        setErrorMessage(`同步失敗 (${successCount}/${parsedItems.length})。錯誤：${errorDetail}`);
+      }
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-neutral-100 flex items-center justify-center p-4">
+      <div className="w-full max-w-lg bg-white rounded-3xl shadow-2xl overflow-hidden border border-neutral-200">
+        
+        {/* Header */}
+        <div className="bg-slate-900 p-8 text-white relative">
+          <div className="absolute top-4 right-4 opacity-20">
+            <History size={64} />
+          </div>
+          <h1 className="text-3xl font-black tracking-tighter">記帳</h1>
+        </div>
+
+        {/* Input Area */}
+        <div className="p-6 space-y-6">
+          <div className="space-y-2">
+            <div className="flex justify-between items-center">
+              <label className="text-sm font-bold text-slate-700 flex items-center gap-1">
+                <Receipt size={16} /> 快速輸入內容
+              </label>
+              <span className="text-[10px] bg-slate-100 text-slate-500 px-2 py-0.5 rounded">
+                格式：M/D 品項金額(卡名)...
+              </span>
+            </div>
+            <textarea
+              value={rawInput}
+              onChange={(e) => setRawInput(e.target.value)}
+              placeholder="範例：4/1 飲料70(玉山) 八方140"
+              className="w-full h-32 p-4 bg-slate-50 border-2 border-slate-200 rounded-2xl focus:border-slate-900 focus:ring-0 transition-all resize-none font-medium placeholder:text-slate-300"
+            />
+          </div>
+
+          {/* Real-time Preview */}
+          <div className="space-y-3">
+            <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest px-1">解析預覽</h3>
+            <div className="max-h-64 overflow-y-auto pr-1 custom-scrollbar text-left space-y-4">
+              {parsedItems.length > 0 ? (
+                Object.entries(
+                  parsedItems.reduce((acc, item) => {
+                    const dateKey = `${item.yearMonth}-${item.day.padStart(2, '0')}`;
+                    if (!acc[dateKey]) acc[dateKey] = [];
+                    acc[dateKey].push(item);
+                    return acc;
+                  }, {})
+                ).map(([date, items], groupIdx) => (
+                  <div key={date} className="space-y-2 animate-in fade-in slide-in-from-right-2" style={{ animationDelay: `${groupIdx * 50}ms` }}>
+                    <div className="flex items-center gap-2 px-1">
+                      <Calendar size={14} className="text-[#990099]" />
+                      <span className="text-xs font-bold text-[#990099] tracking-wider">{date}</span>
+                      <div className="flex-1 h-px bg-slate-200"></div>
+                    </div>
+                    {items.map((item, idx) => (
+                      <div key={idx} className="flex items-center justify-between p-3 bg-white border border-slate-100 rounded-xl shadow-sm hover:shadow-md transition-shadow">
+                        <div className="flex items-center gap-3">
+                          <div className={`p-2 rounded-lg ${item.isCredit ? 'bg-rose-50 text-rose-600' : 'bg-emerald-50 text-emerald-600'}`}>
+                            {item.isCredit ? <CreditCard size={18} /> : <Banknote size={18} />}
+                          </div>
+                          <div>
+                            <div className="text-sm font-bold text-slate-800">{item.item}</div>
+                            <div className="text-[10px] text-slate-400">{item.note ? `• ${item.note}` : '現金支付'}</div>
+                          </div>
+                        </div>
+                        <div className="text-right">
+                          <div className="text-sm font-black text-slate-900">${item.amount}</div>
+                          <div className="text-[10px] font-bold uppercase tracking-tighter text-slate-400">
+                            {item.isCredit ? 'Credit' : 'Cash'}
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ))
+              ) : (
+                <div className="py-8 text-center border-2 border-dashed border-slate-100 rounded-2xl">
+                  <HelpCircle className="mx-auto text-slate-200 mb-2" size={32} />
+                  <p className="text-sm text-slate-400">請輸入資料開始解析</p>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* CORS Error Help Message */}
+          {showCorsHelp && (
+            <div className="bg-orange-50 border border-orange-200 rounded-2xl p-4 animate-in fade-in slide-in-from-top-2">
+              <h4 className="flex items-center text-sm font-bold text-orange-800 mb-2">
+                <Info size={16} className="mr-1.5" /> 
+                為何會連線失敗 (Failed to fetch)？
+              </h4>
+              <p className="text-xs text-orange-700 leading-relaxed mb-2">
+                這是因為 Google 擋住了外部網頁的存取。請回到 Apps Script 執行以下操作：
+              </p>
+              <ol className="text-xs text-orange-800 list-decimal list-inside space-y-1 font-medium bg-white/60 p-3 rounded-xl">
+                <li>點擊右上角 <strong>「部署」</strong> &gt; <strong>「管理部署作業」</strong></li>
+                <li>點擊 <strong>鉛筆圖示 (編輯)</strong></li>
+                <li>版本下拉選單 <strong>「務必選擇新版本」</strong></li>
+                <li>誰可以存取：<strong>「務必選所有人 (Anyone)」</strong></li>
+                <li>點擊 <strong>「部署」</strong> 並重新授權。</li>
+              </ol>
+            </div>
+          )}
+
+          {/* Status Display */}
+          {status === 'success' && (
+            <div className="flex items-center p-4 bg-emerald-500 text-white rounded-2xl shadow-lg shadow-emerald-200 animate-bounce">
+              <CheckCircle2 size={24} className="mr-3 flex-shrink-0" />
+              <div className="text-sm font-bold">成功同步到 Google Sheets！</div>
+            </div>
+          )}
+
+          {status === 'error' && !showCorsHelp && (
+            <div className="flex items-center p-4 bg-rose-500 text-white rounded-2xl shadow-lg shadow-rose-200">
+              <AlertCircle size={24} className="mr-3 flex-shrink-0" />
+              <div className="text-sm font-bold truncate">{errorMessage}</div>
+            </div>
+          )}
+
+          {/* Submit Button */}
+          <button
+            onClick={handleSubmitAll}
+            disabled={status === 'loading' || parsedItems.length === 0}
+            className={`w-full py-4 rounded-2xl text-white font-black text-lg transition-all shadow-xl
+              ${status === 'loading' || parsedItems.length === 0
+                ? 'bg-slate-200 cursor-not-allowed text-slate-400 shadow-none' 
+                : 'bg-slate-900 hover:bg-black active:scale-95'
+              }`}
+          >
+            {status === 'loading' ? (
+              <span className="flex items-center justify-center gap-2">
+                <svg className="animate-spin h-5 w-5 text-white" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                處理中...
+              </span>
+            ) : (
+              `同步 ${parsedItems.length} 筆資料`
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
